@@ -1,159 +1,214 @@
 const puppeteer = require("puppeteer");
 const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
 
-// Get parameters from command line: node grafana.js [project] [env]
-// Example: node grafana.js elx int
-// Function to take a screenshot for a specific project and env
-async function takeScreenshot(project = "elx", env = "int", timeRange = "30d", targetPods = []) {
-  // Normalize targetPods to an array
-  const pods = Array.isArray(targetPods) 
-    ? (targetPods.length > 0 ? targetPods : [""]) 
-    : [targetPods || ""];
+/**
+ * CONFIGURATION
+ * Centralizing defaults and selectors for easier maintenance.
+ */
+const CONFIG = {
+  DEFAULT_VIEWPORT: { width: 1920, height: 1200 },
+  REPORTS_DIR: "reports",
+  WAIT_TIMEOUT: 30000,
+  GRAFANA_SELECTORS: {
+    userField: 'input[name="user"]',
+    passField: 'input[name="password"]',
+    submitBtn: 'button[type="submit"]',
+    panelItem: '.react-grid-item',
+    loadingIndicators: '.panel-loading, .loading-indicator, [data-testid="panel-loading-indicator"], .refresh-picker-icon--spin'
+  }
+};
 
+/**
+ * LOGGER
+ * Simple utility for consistent console output.
+ */
+const log = (msg, level = "INFO", context = "") => {
+  const timestamp = new Date().toLocaleTimeString();
+  const ctx = context ? `[${context}]` : "";
+  console.log(`${timestamp} | ${level.padEnd(5)} | ${ctx} ${msg}`);
+};
+
+/**
+ * UTILS
+ */
+const ensureDirectory = (dir) => {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+};
+
+const smartWait = async (page, context) => {
+  log("Waiting for panels to load data...", "INFO", context);
+  await page.waitForSelector(CONFIG.GRAFANA_SELECTORS.panelItem, { timeout: CONFIG.WAIT_TIMEOUT });
+
+  await page.waitForFunction((selectors) => {
+    const loaders = document.querySelectorAll(selectors);
+    return loaders.length === 0;
+  }, { timeout: CONFIG.WAIT_TIMEOUT }, CONFIG.GRAFANA_SELECTORS.loadingIndicators);
+
+  log("Data loaded. Finalizing render (2s)...", "INFO", context);
+  await new Promise(r => setTimeout(r, 2000));
+};
+
+const isolatePodInLegend = async (page, podName, context) => {
+  if (!podName) return;
+  
+  const cleanPod = podName.trim();
+  const lowerPod = cleanPod.toLowerCase();
+  
+  try {
+    log(`Attempting to isolate "${cleanPod}" in legends...`, "INFO", context);
+
+    // Case-insensitive search using translate()
+    const legendXpath = `xpath///button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "${lowerPod}")]`;
+    const targetButtons = await page.$$(legendXpath);
+
+    if (targetButtons.length === 0) {
+      log(`No legend item found matching "${cleanPod}"`, "WARN", context);
+      return;
+    }
+
+    for (const button of targetButtons) {
+      const btnText = await page.evaluate(el => el.textContent, button);
+      log(`Legend match: "${btnText.trim()}"`, "DEBUG", context);
+      await button.click({ modifiers: ['Shift'] });
+    }
+
+    await new Promise(r => setTimeout(r, 1000));
+    log(`Isolated in ${targetButtons.length} chart(s).`, "SUCCESS", context);
+  } catch (e) {
+    log(`Legend isolation error: ${e.message}`, "ERROR", context);
+  }
+};
+
+/**
+ * MAIN LOGIC
+ */
+async function takeScreenshot({
+  project = "elx",
+  env = "int",
+  duration = "30d",
+  pods = [],
+  viewport = CONFIG.DEFAULT_VIEWPORT,
+  dashboardUid = "85a562078cdf77779eaa1add43ccec1e",
+  dashboardSlug = "kubernetes-compute-resources-namespace-pods",
+  namespace = null,
+  headless = true
+} = {}) {
+  const contextPrefix = `${project}-${env}-${duration}`;
+  const targetPods = Array.isArray(pods) ? (pods.length > 0 ? pods : [""]) : [pods || ""];
+  
+  // Use provided namespace or fallback to default pattern
+  const activeNamespace = namespace || `${project}-coremedia`;
+  
   const browser = await puppeteer.launch({
-    headless: true,
+    headless: headless,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
 
   const page = await browser.newPage();
-  await page.setViewport({ width: 1920, height: 1200 });
+  await page.setViewport(viewport);
 
   try {
-    const baseUrl = `https://grafana-${env}-${project}.${process.env.GRAFANA_BASE_DOMAIN}`;
+    const domain = process.env.GRAFANA_BASE_DOMAIN;
+    const baseUrl = `https://grafana-${env}-${project}.${domain}`;
 
     // 1. LOGIN
-    console.log(`[${project}-${env}][${timeRange}] Navigating to login page...`);
-    await page.goto(`${baseUrl}/login`, {
-      waitUntil: "networkidle2"
-    });
+    log(`Navigating to login...`, "INFO", contextPrefix);
+    await page.goto(`${baseUrl}/login`, { waitUntil: "networkidle2" });
 
-    console.log(`[${project}-${env}][${timeRange}] Typing credentials...`);
-    await page.type('input[name="user"]', process.env.GRAFANA_USER || "admin");
-    await page.type('input[name="password"]', process.env.GRAFANA_PASSWORD || "");
-
-    console.log(`[${project}-${env}][${timeRange}] Submitting login form...`);
+    log(`Authenticating as ${process.env.GRAFANA_USER}...`, "INFO", contextPrefix);
+    await page.type(CONFIG.GRAFANA_SELECTORS.userField, process.env.GRAFANA_USER || "admin");
+    await page.type(CONFIG.GRAFANA_SELECTORS.passField, process.env.GRAFANA_PASSWORD || "");
+    
     await Promise.all([
-      page.click('button[type="submit"]'),
+      page.click(CONFIG.GRAFANA_SELECTORS.submitBtn),
       page.waitForNavigation({ waitUntil: "networkidle2" })
     ]);
 
-    // 2. LOOP THROUGH PODS
-    for (const targetPod of pods) {
+    // 2. PROCESS PODS
+    for (const targetPod of targetPods) {
+      const podCtx = targetPod ? `${contextPrefix}][${targetPod}` : contextPrefix;
+      
       try {
-        const podLogPrefix = targetPod ? `[${targetPod}]` : "[General]";
+        const url = `${baseUrl}/d/${dashboardUid}/${dashboardSlug}?orgId=1&from=now-${duration}&to=now&timezone=Asia%2FSingapore&var-datasource=default&var-namespace=${activeNamespace}&refresh=off&kiosk`;
+
+        log(`Opening dashboard...`, "INFO", podCtx);
         
-        // 2.1 NAVIGATE TO DASHBOARD
-        // Using dynamic from=now-${timeRange}
-        const url = `${baseUrl}/d/85a562078cdf77779eaa1add43ccec1e/kubernetes-compute-resources-namespace-pods?orgId=1&from=now-${timeRange}&to=now&timezone=Asia%2FSingapore&var-datasource=default&var-namespace=${project}-coremedia&refresh=off&kiosk`;
-
-        console.log(`[${project}-${env}][${timeRange}]${podLogPrefix} Navigating to dashboard...`);
-        await page.goto(url, { waitUntil: "networkidle0" });
-
-        // 2.2 SMART WAIT FOR RENDERING
-        console.log(`[${project}-${env}][${timeRange}]${podLogPrefix} Waiting for panels to load data...`);
-        await page.waitForSelector('.react-grid-item', { timeout: 30000 });
-
-        await page.waitForFunction(() => {
-          const loaders = document.querySelectorAll(
-            '.panel-loading, .loading-indicator, [data-testid="panel-loading-indicator"], .refresh-picker-icon--spin'
-          );
-          return loaders.length === 0;
-        }, { timeout: 30000 });
-
-        console.log(`[${project}-${env}][${timeRange}]${podLogPrefix} Data loaded. Finalizing render (2s)...`);
-        await new Promise(r => setTimeout(r, 2000));
-
-        // 2.3 ISOLATE TARGET POD IN LEGEND
-        if (targetPod) {
-          const cleanPod = targetPod.trim();
-          const lowerPod = cleanPod.toLowerCase();
+        let retries = 3;
+        while (retries > 0) {
           try {
-            console.log(`[${project}-${env}][${timeRange}][${cleanPod}] Attempting to isolate in all legends...`);
-
-            // Case-insensitive search using translate()
-            const legendXpath = `xpath///button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "${lowerPod}")]`;
-            const targetButtons = await page.$$(legendXpath);
-
-            if (targetButtons.length === 0) {
-              console.log(`[${project}-${env}][${timeRange}][${cleanPod}] WARNING: No legend item found matching "${cleanPod}"`);
-            }
-
-            for (const button of targetButtons) {
-              const btnText = await page.evaluate(el => el.textContent, button);
-              console.log(`[${project}-${env}] Legend match: "${btnText.trim()}"`);
-              await button.click({ modifiers: ['Shift'] });
-            }
-
-            await new Promise(r => setTimeout(r, 1000));
-            console.log(`[${project}-${env}][${timeRange}][${cleanPod}] Isolated in ${targetButtons.length} chart(s).`);
+            await page.goto(url, { waitUntil: "networkidle0", timeout: CONFIG.WAIT_TIMEOUT });
+            break;
           } catch (e) {
-            console.log(`[${project}-${env}][${timeRange}][${cleanPod}] Legend item error: ${e.message}`);
+            retries--;
+            log(`Navigation failed. Retrying (${retries} left)... ${e.message}`, "WARN", podCtx);
+            if (retries === 0) throw e;
+            await new Promise(r => setTimeout(r, 5000));
           }
         }
 
-        // 2.4 SCREENSHOT
-        const reportsDir = "reports";
-        if (!fs.existsSync(reportsDir)) {
-          fs.mkdirSync(reportsDir);
-        }
+        await smartWait(page, podCtx);
+        await isolatePodInLegend(page, targetPod, podCtx);
 
+        // 3. CAPTURE
+        ensureDirectory(CONFIG.REPORTS_DIR);
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const podSuffix = targetPod ? `-${targetPod}` : "";
-        const filename = `${project}-${env}-${timeRange}${podSuffix}-grafana-${timestamp}.png`;
-        const filePath = `${reportsDir}/${filename}`;
+        const filename = `${project}-${env}-${duration}${podSuffix}-grafana-${timestamp}.png`;
+        const filePath = path.join(CONFIG.REPORTS_DIR, filename);
 
-        console.log(`[${project}-${env}][${timeRange}]${podLogPrefix} Taking screenshot: ${filePath}...`);
-        await page.screenshot({ path: filePath });
+        log(`Capturing screenshot...`, "INFO", podCtx);
+        await page.screenshot({ path: filePath, fullPage: false });
+        log(`Success! Saved to ${filePath}`, "SUCCESS", podCtx);
 
-        console.log(`[${project}-${env}][${timeRange}]${podLogPrefix} Success! Saved to ${filePath}`);
-      } catch (podError) {
-        console.error(`[${project}-${env}][${timeRange}] Error processing pod "${targetPod}":`, podError.message);
+      } catch (stepError) {
+        log(`Failed at step: ${stepError.message}`, "ERROR", podCtx);
       }
     }
 
-
   } catch (error) {
-    console.error(`[${project}-${env}][${timeRange}] Error occurred:`, error.message);
+    log(`Critical Error: ${error.message}`, "ERROR", contextPrefix);
   } finally {
     await browser.close();
+    log("Browser closed.", "INFO", contextPrefix);
   }
 }
 
 // Export for use in run-all.js
 module.exports = { takeScreenshot };
 
-// If run directly from command line
+/**
+ * CLI HANDLER
+ */
 if (require.main === module) {
   const yargs = require("yargs/yargs");
   const { hideBin } = require("yargs/helpers");
 
   const argv = yargs(hideBin(process.argv))
-    .option("project", {
-      alias: "p",
-      type: "string",
-      description: "Project name (e.g., elx)",
-      default: "elx"
-    })
-    .option("env", {
-      alias: "e",
-      type: "string",
-      description: "Environment (e.g., int, uat)",
-      default: "int"
-    })
-    .option("duration", {
-      alias: "d",
-      type: "string",
-      description: "Time range (e.g., 7d, 24h)",
-      default: "30d"
-    })
-    .option("pod", {
-      type: "array",
-      description: "Target pod name(s) to isolate",
-      default: []
-    })
+    .option("project", { alias: "p", type: "string", default: "elx", description: "Project name" })
+    .option("env", { alias: "e", type: "string", default: "int", description: "Environment" })
+    .option("duration", { alias: "d", type: "string", default: "30d", description: "Time range (e.g. 1h, 7d)" })
+    .option("pod", { type: "array", default: [], description: "Pod(s) to isolate" })
+    .option("namespace", { alias: "n", type: "string", description: "Kubernetes namespace override" })
+    .option("width", { type: "number", default: 1920, description: "Viewport width" })
+    .option("height", { type: "number", default: 1200, description: "Viewport height" })
+    .option("dashboard", { type: "string", description: "Custom dashboard UID" })
+    .option("visible", { type: "boolean", default: false, description: "Run with browser visible" })
     .help()
     .argv;
 
-  takeScreenshot(argv.project, argv.env, argv.duration, argv.pod);
+  // Execute
+  takeScreenshot({
+    project: argv.project,
+    env: argv.env,
+    duration: argv.duration,
+    pods: argv.pod,
+    namespace: argv.namespace,
+    viewport: { width: argv.width, height: argv.height },
+    dashboardUid: argv.dashboard, // Optional override
+    headless: !argv.visible
+  });
 }

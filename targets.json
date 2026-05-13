@@ -1,0 +1,8 @@
+[
+  { "project": "elx", "env": "uat" },
+  { "project": "ebl", "env": "uat" },
+  { "project": "hel", "env": "uat" },
+  { "project": "tr", "env": "uat" },
+  { "project": "elec", "env": "uat", "namespace": "aav-coremedia" },
+  { "project": "pvi", "env": "uat" }
+]
