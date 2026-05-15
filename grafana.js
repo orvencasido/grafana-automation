@@ -223,7 +223,7 @@ async function takeScreenshot({
 }
 
 // Export for use in run-all.js
-module.exports = { takeScreenshot };
+module.exports = { takeScreenshot, sendEmail };
 
 /**
  * CLI HANDLER
@@ -242,8 +242,17 @@ if (require.main === module) {
     .option("height", { type: "number", default: 1200, description: "Viewport height" })
     .option("dashboard", { type: "string", description: "Custom dashboard UID" })
     .option("visible", { type: "boolean", default: false, description: "Run with browser visible" })
+    // Email Overrides
+    .option("email-user", { type: "string", description: "SMTP User override" })
+    .option("email-pass", { type: "string", description: "SMTP Password override" })
+    .option("email-to", { type: "string", description: "Recipient(s) override" })
     .help()
     .argv;
+
+  // Apply CLI overrides to process.env for convenience
+  if (argv["email-user"]) process.env.EMAIL_USER = argv["email-user"];
+  if (argv["email-pass"]) process.env.EMAIL_PASS = argv["email-pass"];
+  if (argv["email-to"]) process.env.EMAIL_TO = argv["email-to"];
 
   // Execute
   takeScreenshot({
