@@ -1,6 +1,7 @@
 const puppeteer = require("puppeteer");
 const fs = require("fs");
 const path = require("path");
+const nodemailer = require("nodemailer");
 require("dotenv").config();
 
 /**
@@ -50,6 +51,41 @@ const smartWait = async (page, context) => {
 
   log("Data loaded. Finalizing render (2s)...", "INFO", context);
   await new Promise(r => setTimeout(r, 2000));
+};
+
+const sendEmail = async (attachments, context) => {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    log("Email credentials missing in .env. Skipping email.", "WARN", context);
+    return;
+  }
+
+  log(`Preparing to send email with ${attachments.length} attachment(s)...`, "INFO", context);
+
+  const transporter = nodemailer.createTransport({
+    service: process.env.EMAIL_SERVICE || 'gmail',
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+  });
+
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: process.env.EMAIL_TO || process.env.EMAIL_USER,
+    subject: `Grafana Automation Report - ${new Date().toLocaleString()}`,
+    text: `Attached are the screenshots generated for ${context}.\n\nTotal images: ${attachments.length}`,
+    attachments: attachments.map(p => ({
+      filename: path.basename(p),
+      path: p
+    }))
+  };
+
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    log(`Email sent successfully: ${info.messageId}`, "SUCCESS", context);
+  } catch (error) {
+    log(`Failed to send email: ${error.message}`, "ERROR", context);
+  }
 };
 
 const isolatePodInLegend = async (page, podName, context) => {
@@ -111,6 +147,8 @@ async function takeScreenshot({
   const page = await browser.newPage();
   await page.setViewport(viewport);
 
+  const capturedFiles = [];
+
   try {
     const domain = process.env.GRAFANA_BASE_DOMAIN;
     const baseUrl = `https://grafana-${env}-${project}.${domain}`;
@@ -164,9 +202,16 @@ async function takeScreenshot({
         await page.screenshot({ path: filePath, fullPage: false });
         log(`Success! Saved to ${filePath}`, "SUCCESS", podCtx);
 
+        capturedFiles.push(filePath);
+
       } catch (stepError) {
         log(`Failed at step: ${stepError.message}`, "ERROR", podCtx);
       }
+    }
+
+    // 4. SEND EMAIL
+    if (capturedFiles.length > 0) {
+      await sendEmail(capturedFiles, contextPrefix);
     }
 
   } catch (error) {
